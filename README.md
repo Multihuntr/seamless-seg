@@ -45,11 +45,11 @@ def minimal_random_colour_grid(image_size, tile_size, overlap):
     seamless_seg.run_plan(plan, batch_size, max_tiles, _write_tile, get_tile=_get_tile)
 ```
 
-## Fixing tiling artifacts
+## Explanation - Fixing tiling artifacts
 
 ### Where do tiling artifacts come from?
 
-Tiling artifacts are a result of hard boundaries between adajcent tiles. The most naive approach is select tiles with no overlap, and just let the model predict whatever it wills. At the boundary of those tiles, models will often make significantly different predictions. This results in sharp lines in your output segmentation.
+Tiling artifacts are a result of hard boundaries between adajcent tiles. The most naive approach is to select tiles with no overlap, and just let the model predict whatever it wills. At the boundary of those tiles, models will often make significantly different predictions. This results in sharp lines in your output segmentation.
 
 TODO: Real example
 
