@@ -1,0 +1,10 @@
+name: seamless
+channels:
+    - conda-forge
+    - nodefaults
+dependencies:
+    - numpy
+    - shapely
+    - scipy
+    - scikit-image
+    - pillow
