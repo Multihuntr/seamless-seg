@@ -1,8 +1,8 @@
-# Seamless segmentation (seamless_seg)
+# `seamless_seg`: Seamless tiled segmentation postprocessing tools for large images
 
-This is an algorithm that removes tiling artifacts created from stitching together adjacent tiles in large segmentation tasks. This is useful for any segmentation task with very large images. For example, medical and satellite images.
+Typical strategies for segmenting large images involve tiling. Unfortunately this can cause visible, obviously incorrect seams between tiles. This repo provides postprocessing functions which gracefully remove *all* such tiling artifacts for any segmentation task.
 
-TODO: Real example images
+<!-- TODO: Real example images -->
 
 * :white_check_mark: Optimal! No more tiling artifacts. Guaranteed seamless segmentation for any segmentation model.
 * :floppy_disk: Efficient! Needs <1% of image in memory at once for large images (40000x40000 and above).
@@ -15,7 +15,7 @@ Copy `seamless_seg.py` into your project.
 
 Dependencies: `shapely` and `scipy`.
 
-TODO: pip?
+<!-- TODO: pip? -->
 
 ## Getting started
 
@@ -51,7 +51,7 @@ def minimal_random_colour_grid(image_size, tile_size, overlap):
 
 Tiling artifacts are a result of hard boundaries between adajcent tiles. The most naive approach is to select tiles with no overlap, and just let the model predict whatever it wills. At the boundary of those tiles, models will often make significantly different predictions. This results in sharp lines in your output segmentation.
 
-TODO: Real example
+<!-- TODO: Real example -->
 
 This is not a model failure per se. The problem is just that the model is using a different context for pixels on one side of a boundary to the other side of that boundary. If it were given a full context around each object, it may still segment it correctly.
 
@@ -59,9 +59,9 @@ This is not a model failure per se. The problem is just that the model is using 
 
 Typical solutions to this will always somehow use overlapping tiles. A slightly less naive approach commonly taken is to overlap tiles, and only keep a smaller window of the outputs. That solution *reduces* tiling artifacts, but does not remove them entirely. So long as there are hard boundaries between the tiles, tiling artifacts will appear.
 
-TODO: Diagram explaining output crop margin.
+<!-- TODO: Diagram explaining output crop margin. -->
 
-TODO: Example of reducing tiling artifacts.
+<!-- TODO: Example of reducing tiling artifacts. -->
 
 In the extreme case, we could evaluate a tile centered on every single pixel independently and only trust that central pixel. But this involves lots of redundant calculation. We need a better solution.
 
@@ -69,15 +69,15 @@ In the extreme case, we could evaluate a tile centered on every single pixel ind
 
 Pixels at the edge of each tile have a truncated context because of their position within the tile. This lack of context degrades model performance at the edges of each tile.
 
-TODO: Diagram showing truncated context, and
+<!-- TODO: Diagram showing truncated context -->
 
 In some sense, this means that we should inherently trust the pixels at the edges less than those at the centre. So, we define a map of trustworthiness of each pixel. This is simply a measure of the distance of that pixel to the centre of the tile.
 
-TODO: image of circle of trust
+<!-- TODO: image of circle of trust -->
 
 We can use the trust values to determine how much we should use from each overlapping tile. This gives us a distinct weighted sum at each pixel. Using a weighted sum based on distance produces a smooth transition across tiles. Pixels at the centre of an output tile come entirely from the model output for that tile, and pixels halfway between two tiles come 50% from each, etc.
 
-TODO: diagram showing spatial relationship between these tiles.
+<!-- TODO: diagram showing spatial relationship between these tiles. -->
 
 ![Eight-way smoothing with 50% overlap](img/8_way_smoothing.png)
 ![Eight-way smoothing with approx 10% overlap](img/8_way_small_overlap.png)
