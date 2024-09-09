@@ -44,7 +44,7 @@ def minimal_random_colour_grid(image_size, tile_size, overlap):
     for index, out_geom, out_tile in seamless_seg.run_plan(plan, in_tiles):
         y_slc, x_slc = seamless_seg.shape_to_slices(out_geom)
         out_img[y_slc, x_slc] = out_tile
-    # All done!
+    return out_img
 ```
 
 Here is an unbatched example using a pytorch model on a geotiff with rasterio
