@@ -1,8 +1,9 @@
+import collections
 import dataclasses
-import functools
 import queue
 import threading
-from typing import Sequence
+from pathlib import Path
+from typing import Sequence, Iterable, Generator
 
 import numpy as np
 import scipy
@@ -72,18 +73,7 @@ def overlap_weights(
     Invoking this does not depend on any real data.
     When trim_bounds is provided, it forces the output to be sliced to fit those bounds.
 
-    Example usage:
-    ```
-    # Assuming we have: central_geom, nearby_geoms, central_tile, nearby_tiles
-
-    out_geom, central_weights, centre_from_tile_slc, nearby_weights, slice_pairs = \
-        nearby_weights(central_geom, nearby_geoms)
-    out_tile = central_tile[centre_from_tile_slc] * central_weights[..., None]
-    for i, (nearby_weight, (central_slices, nearby_slices)) in enumerate(zip(nearby_weights, slice_pairs)):
-        out_tile[central_slices] += nearby_geoms[i][nearby_slices] * nearby_weight[central_slices][..., None]
-
-    # out_tile is now real a blend of the central and nearby tiles
-    ```
+    For simple use cases, use in conjunction with seamless_seg.apply_weights.
 
     By default, overlap_weights describes the full area of the central geometry.
     Thus, using it once each on adjacent tiles describes the overlapping area between
@@ -114,7 +104,7 @@ def overlap_weights(
         central_weights: how much to use the data from central per-pixel (0 to 1)
         centre_from_tile_slc: slices into tile defined by central to select out_geom
         nearby_weights: how much to use each of the nearby geometries
-        slice_pairs: how to read from central_weights and nearby weights for combining
+        slice_pairs: how to read from central_weights and nearby_weights for combining
     """
     # Make circle of trust for the central geom
     ylo, xlo, yhi, xhi = central.bounds
@@ -163,30 +153,22 @@ def overlap_weights(
     return central, central_weights, centre_from_tile_slc, nearby_weights, slice_pairs
 
 
-def default_eightway_weights(tile_size: tuple[int, int], overlap: tuple[int,int]):
-    # Calculate sizes
-    th, tw = tile_size
-    ov, oh = overlap
-    if ov % 2 != 0 or oh % 2 != 0:
-        raise ValueError('Overlap must be an even number of pixels')
-    margin = ov//2, oh//2
-    vo, ho = th - ov, tw - oh
+def apply_weights(central_tile: np.ndarray, nearby_tiles: list[np.ndarray], weights):
+    """
+    Apply overlap weights to real tile data.
 
-    # Create geometries for finding overlaps
-    eightway = np.array([
-        shapely.box(
-            0 + ydir * vo,
-            0 + xdir * ho,
-            th + ydir * vo,
-            tw + xdir * ho)
-        for ydir, xdir in GRID_DIR
-    ])
-    central = shapely.box(0, 0, th, tw)
-
-    # Get trimmed weights/slices, assuming all 8 directions are filled
-    trim_bounds = get_trimmed_bounds(margin, GRID_DIR)
-    weight = overlap_weights(central, eightway, trim_bounds)
-    return weight
+    Example usage:
+    ```
+    # Assuming we have: central_geom, nearby_geoms, central_tile, nearby_tiles
+    weights = seamless_seg.overlap_weights(central_geom, nearby_geoms)
+    out_geom, out_tile = seamless_seg.apply_weights(central_tile, nearby_tiles, weights)
+    ```
+    """
+    out_geom, central_weights, centre_from_tile_slc, nearby_weights, slice_pairs = weights
+    out_tile = central_tile[centre_from_tile_slc] * central_weights[..., None]
+    for i, (nearby_weight, (central_slices, nearby_slices)) in enumerate(zip(nearby_weights, slice_pairs)):
+        out_tile[central_slices] += nearby_tiles[i][nearby_slices] * nearby_weight[central_slices][..., None]
+    return out_geom, out_tile
 
 
 def mk_box_grid(width, height, x_offset=0, y_offset=0, box_width=1, box_height=1, overlap_x=0, overlap_y=0):
@@ -207,6 +189,7 @@ def mk_box_grid(width, height, x_offset=0, y_offset=0, box_width=1, box_height=1
     ]).transpose((2,3,0,1)) # shapes [4, 2, W, H] -> [W, H, 4, 2]
     # fmt: on
     return shapely.polygons(coords)
+
 
 def calc_gridcell_needed(grid_mask):
     # Calculate which grid cells are needed to calculate grid cells that are in grid_mask
@@ -290,7 +273,12 @@ def row_by_row_traversal(grid, add_load, add_unload, add_write):
             add_unload(gy, gw-1)
 
 
-def _prepare_grid(image_size, tile_size, overlap, area=None):
+def regular_grid(
+        image_size: tuple[int, int],
+        tile_size: tuple[int, int],
+        overlap: tuple[int, int],
+        area: shapely.Geometry=None
+) -> np.ndarray[shapely.Geometry]:
     # Unpack sizes
     ih, iw = image_size
     th, tw = tile_size
@@ -322,7 +310,8 @@ def _prepare_grid(image_size, tile_size, overlap, area=None):
         gap = int(xhi-gbxhi)
         grid_strip = np.array([shapely.affinity.translate(cell, 0, gap) for cell in grid[:, -1]])
         grid = np.concatenate([grid, grid_strip[:, None]], axis=1)
-    return grid, area
+    return grid
+
 
 def _mk_cache_hash(geom, dir_mask, nearby):
     # Assuming tiles are always the same size, then
@@ -344,26 +333,28 @@ class WriteStep(Step):
     nearby: Sequence[tuple[int, int]] # indexes of geoms defined as nearby
     weight: tuple # outputs of overlap_weights
 
-def plan_run_grid(
-    image_size: tuple[int, int],
-    tile_size: tuple[int, int],
-    overlap: tuple[int, int],
-    area: shapely.Geometry = None,
-    traversal_fnc: callable = row_by_row_traversal,
-) -> (list[Step], np.ndarray[shapely.Geometry]):
+def plan_from_grid(
+        grid: np.ndarray[shapely.Geometry],
+        margin: tuple[int, int] = (0, 0),
+        area: shapely.Geometry = None,
+        traversal_fnc: callable = row_by_row_traversal
+) -> list[Step]:
     """
-    Plans out running segmentation over a single large image by tiling, overlapping
-    and blending between adjacent tiles.
+    Create a plan for running on a somewhat arbitrary grid.
+
+    There is a restriction/assumption that must be satisfied:
+    For each geometry at grid[y, x] the only geoms which overlap a tile are within +-1
+    e.g. for grid[5, 5], the only geoms which overlap it are in the range grid[4:7, 4:7]
 
     IMPORTANT: All inputs should be YX, not XY.
 
-    Does not depend on any real data; merely creates a geometry plan based on size data.
-
+    `margin` if provided, will subtract a margin from every tile not at the edges
+            WARNING: strongly coupled with the grid; currently only proven to work with regular grid.
     `area` can be any arbitrary geometry (i.e. need not be a rectangle)
     `traversal_fnc` lets you define a custom grid traversal algorithm, a callable with:
         traversal_fnc(grid, add_load_step, add_unload_step, add_write_step)
         Which decides when to load which tiles, when to unload them, and when to write them.
-        Doesn't need to worry about whether those grid tiles are actually real or not.
+        Doesn't need to worry about whether those grid tiles are actually possible or not.
 
     Returns:
         plan (list[Step]): Describes how to manage the cache, and when/how to write tiles.
@@ -371,19 +362,17 @@ def plan_run_grid(
         grid (np.ndarray[shapely.Geometry]): shaped [H, W], a grid of geometries describing
             where each tile is placed within the image.
     """
-    ih, iw = image_size
-    oh, ow = overlap
-    if not(oh % 2 == 0 or ow % 2 == 0):
-        raise ValueError('Overlap must be an even number')
-    margin = oh // 2, ow // 2
-    weight_cache = {}
+    if area is None:
+        _, _, gyhi, gxhi = shapely.unary_union(grid).bounds
+        area = shapely.box(0, 0, gyhi, gxhi)
 
-    grid, area = _prepare_grid(image_size, tile_size, overlap, area)
+    # Determine grid boundaries and which cells are possible
     gh, gw = grid.shape[:2]
     grid_in_area = shapely.intersects(grid, area)
     gridcell_needed = calc_gridcell_needed(grid_in_area)
 
     plan = []
+    weight_cache = {}
     # By pushing these to helper functions we separate the traversal logic from
     # deciding to load/unload/write only for tiles that need it (based on provided area)
     def _in_bounds(gy, gx):
@@ -396,7 +385,7 @@ def plan_run_grid(
             plan.append(Step(action='unload', index=(gy, gx)))
     def _calc_weight(gy, gx, geom, dir_mask):
         # Check which directions are within the grid
-        nearby = [(gy + j, gx + i) for j, i in GRID_DIR[dir_mask]]
+        nearby = [(int(gy + j), int(gx + i)) for j, i in GRID_DIR[dir_mask]]
         nearby_geom = np.array([grid[y, x] for y, x in nearby])
         # Based on which directions have a tile, determine how to trim the output
         trim_bounds = get_trimmed_bounds(margin, GRID_DIR[dir_mask])
@@ -426,26 +415,93 @@ def plan_run_grid(
 
     traversal_fnc(grid, _add_load_step, _add_unload_step, _add_write_step)
 
-    return plan, grid
+    return plan
+
+def plan_regular_grid(
+    image_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    overlap: tuple[int, int],
+    area: shapely.Geometry = None,
+    traversal_fnc: callable = row_by_row_traversal,
+) -> tuple[list[Step], np.ndarray[shapely.Geometry]]:
+    """
+    Plans out running segmentation over a single large image by tiling, overlapping
+    and blending between adjacent tiles in a regular grid.
+
+    IMPORTANT: All inputs should be YX, not XY.
+
+    Does not depend on any real data; merely creates a geometry plan based on size data.
+
+    `area` can be any arbitrary geometry (i.e. need not be a rectangle)
+    `traversal_fnc` lets you define a custom grid traversal algorithm, a callable with:
+        traversal_fnc(grid, add_load_step, add_unload_step, add_write_step)
+        Which decides when to load which tiles, when to unload them, and when to write them.
+        Doesn't need to worry about whether those grid tiles are actually possible or not.
+
+    Returns:
+        plan (list[Step]): Describes how to manage the cache, and when/how to write tiles.
+            Steps can be load, unload or write.
+        grid (np.ndarray[shapely.Geometry]): shaped [H, W], a grid of geometries describing
+            where each tile is placed within the image.
+    """
+    oh, ow = overlap
+    if not(oh % 2 == 0 or ow % 2 == 0):
+        raise ValueError('Overlap must be an even number')
+    margin = oh // 2, ow // 2
+    grid = regular_grid(image_size, tile_size, overlap, area)
+    return plan_from_grid(grid, margin, area, traversal_fnc), grid
 
 
-def _tile_getter(geoms, batch_size, get_tiles_batched, out_queue: queue.Queue):
+def batched_tile_get(
+        geoms: list[tuple[tuple[int, int], shapely.Geometry]],
+        batch_size: int,
+        get_tiles_fnc: callable,
+):
+    """
+    Takes some function to get tiles `get_tiles_fnc` which is to expect a batch of geoms at once.
+    Yields individual tiles
+    """
     batch_indices = []
     batch_geoms = []
     for index, geom in geoms:
         batch_indices.append(index)
         batch_geoms.append(geom)
         if len(batch_geoms) == batch_size:
-            tiles = get_tiles_batched(batch_indices, batch_geoms)
-            for tile in tiles:
-                out_queue.put(tile)
+            tiles = get_tiles_fnc(batch_indices, batch_geoms)
+            for past_index, tile in zip(batch_indices, tiles):
+                yield tile
             batch_indices = []
             batch_geoms = []
-    tiles = get_tiles_batched(batch_indices, batch_geoms)
-    for tile in tiles:
-        out_queue.put(tile)
+    tiles = get_tiles_fnc(batch_indices, batch_geoms)
+    for past_index, tile in zip(batch_indices, tiles):
+        yield tile
 
-def analyse_plan(plan):
+
+def threaded_batched_tile_get(
+        geoms: list[tuple[tuple[int, int], shapely.Geometry]],
+        batch_size: int,
+        get_tiles_fnc: callable,
+        max_prefetched: int,
+) -> Generator[tuple[tuple[int, int], np.ndarray], None, None]:
+    """
+    Takes some function to get tiles `get_tiles_fnc` which is to expect a batch of geoms at once.
+    Executes that function in a thread, prefetching those tiles before they are needed.
+    Yields individual tiles
+    """
+    out_queue = queue.Queue(max_prefetched)
+    def _wrap_queue():
+        for tile in batched_tile_get(geoms, batch_size, get_tiles_fnc):
+            out_queue.put(tile)
+
+    thread = threading.Thread(target=_wrap_queue)
+    thread.start()
+    for _ in geoms:
+        yield out_queue.get()
+
+
+
+def analyse_plan(plan: list[Step]) -> tuple[int, int, int]:
+    """ Counts maximum tiles loaded at once, total tiles loaded, and total write calls."""
     loaded = 0
     total_loaded = 0
     max_loaded = 0
@@ -462,55 +518,100 @@ def analyse_plan(plan):
             write += 1
     return max_loaded, total_loaded, write
 
+
+def get_plan_input_geoms(plan):
+    return [(step.index, step.geom) for step in plan if step.action == 'load']
+
+
 def _check_plan_doesnt_exceed(plan, max_tiles):
+    if max_tiles is None:
+        # No maximum set
+        return
+
     max_loaded, _, _ = analyse_plan(plan)
     if max_loaded > max_tiles:
         raise Exception('Traversal method in plan would hold more than max tiles in memory')
 
+
 def noop(*args, **kwargs): pass
+def serialise_index(index):
+    return f"{index[0]}-{index[1]}.npy"
 def run_plan(
-        plan: list[dict],
-        batch_size: int,
-        max_tiles: int,
-        write_tile: callable,
-        get_tiles_batched: callable = None,
-        get_tile: callable = None,
+        plan: list[Step],
+        tiles: Iterable,
+        max_tiles: int = None,
+        disk_cache_dir: Path = None,
+        on_load: callable = noop,
         on_unload: callable = noop,
         on_step: callable = noop,
-):
-    if (get_tile is None) == (get_tiles_batched is None):
-        raise Exception('Must provide precisely one of get_tile or get_tiles_batched')
+        on_disk_evict: callable = noop,
+        on_disk_restore: callable = noop,
+) -> Generator[tuple[tuple[int, int], shapely.Geometry, np.ndarray], None, None]:
+    cache = collections.OrderedDict()
+    disk_cache = {}
 
-    # Analyse plan to ensure we never need to actually hold more than max_tiles
-    _check_plan_doesnt_exceed(plan, max_tiles)
+    if max_tiles is not None and max_tiles <= 8:
+        raise ValueError("If provided, max_tiles must be greater than 8")
 
-    if get_tiles_batched is not None:
-        # Start a thread to get tiles
-        geoms = [(step.index, step.geom) for step in plan if step.action == 'load']
-        tile_queue = queue.Queue(max_tiles)
-        thread_args = (geoms, batch_size, get_tiles_batched, tile_queue)
-        getter_thread = threading.Thread(target=_tile_getter, args=thread_args)
-        getter_thread.start()
+    if disk_cache_dir is None:
+        _check_plan_doesnt_exceed(plan, max_tiles)
+    else:
+        if max_tiles is None:
+            raise ValueError("If disk_cache_dir is set, then max_tiles should be set")
+        disk_cache_dir.mkdir(exist_ok=True)
+
+    # Two-level cache management functions; evicting to disk and restoring from disk.
+    def _evict_oldest():
+        oldest_index, oldest_tile = cache.popitem(False)
+        on_disk_evict(oldest_index)
+        fpath = disk_cache_dir / serialise_index(oldest_index)
+        np.save(fpath, oldest_tile)
+        disk_cache[oldest_index] = fpath
+
+    def _resolve_restore(index):
+        if index in cache:
+            cache.move_to_end(index)
+            return cache[index]
+        if len(cache) == max_tiles:
+            _evict_oldest()
+        cache[index] = np.load(disk_cache[index])
+        on_disk_restore(index)
+        del disk_cache[index]
+        return cache[index]
+
 
     # Run plan
-    cache = {}
     for n, step in enumerate(plan):
         if step.action == 'load':
-            if get_tiles_batched is not None:
-                # This relies on there being one thread that gets tiles in the correct order
-                cache[step.index] = tile_queue.get()
-            else:
-                cache[step.index] = get_tile(step.index, step.geom)
+            # Put tile into cache
+            if disk_cache_dir is not None:
+                if len(cache) == max_tiles:
+                    _evict_oldest()
+            cache[step.index] = next(tiles)
+            on_load(step.index)
         elif step.action == 'unload':
+            # Remove tile from cache
             del cache[step.index]
             on_unload(step.index)
         elif step.action == 'write':
-            data = [cache[index] for index in step.nearby]
-            out_geom, central_weights, centre_from_tile_slc, nearby_weights, slice_pairs = step.weight
-            out_tile = cache[step.index][centre_from_tile_slc] * central_weights[..., None]
-            for i, (nearby_weight, (central_slices, nearby_slices)) in enumerate(zip(nearby_weights, slice_pairs)):
-                out_tile[central_slices] += data[i][nearby_slices] * nearby_weight[central_slices][..., None]
-            write_tile(step.index, out_geom, out_tile)
+            # Collect nearby tiles
+            nearby_tiles = []
+            for index in step.nearby:
+                if disk_cache_dir is None:
+                    tile = cache[index]
+                else:
+                    tile = _resolve_restore(index)
+                nearby_tiles.append(tile)
+
+            # Collect central tile
+            if disk_cache_dir is None:
+                central_tile = cache[step.index]
+            else:
+                central_tile = _resolve_restore(step.index)
+
+            # Apply weights from plan to create final output tile
+            out_geom, out_tile = apply_weights(central_tile, nearby_tiles, step.weight)
+            yield step.index, out_geom, out_tile
         else:
             raise Exception('Unknown plan action')
         on_step(n)
