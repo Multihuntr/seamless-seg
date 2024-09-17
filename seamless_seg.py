@@ -2,6 +2,7 @@ import collections
 import dataclasses
 import queue
 import threading
+import math
 from pathlib import Path
 from typing import Sequence, Iterable, Generator
 
@@ -28,6 +29,8 @@ def mk_circle_of_trust(h, w):
     return interpolator(eval_coords)
 
 def get_trimmed_bounds(margin: tuple[int, int], dirs: Sequence[tuple[int, int]]):
+    if margin is None:
+        return 0, 0, None, None
     my, mx = margin
     ylo, xlo, yhi, xhi = 0, 0, None, None
     for (j, i) in dirs:
@@ -273,6 +276,102 @@ def row_by_row_traversal(grid, add_load, add_unload, add_write):
             add_unload(gy, gw-1)
 
 
+def _mk_angle_to_dir_fnc(bounds: tuple[int, int, int, int]):
+    ylo, xlo, yhi, xhi = bounds
+    ydif, xdif = (yhi-ylo), (xhi-xlo)
+    diag_angle = math.atan(ydif/xdif)
+    angle_to_dir = {
+        math.pi*0/4: (0, 1),
+        math.pi*0/4+diag_angle: (1, 1),
+        math.pi*2/4: (1, 0),
+        math.pi*4/4-diag_angle: (1, -1),
+        math.pi*4/4: (0, -1),
+        -math.pi*4/4+diag_angle: (-1, -1),
+        -math.pi*2/4: (-1, 0),
+        -math.pi*0/4-diag_angle: (-1, 1)
+    }
+    key_angles = np.array(list(angle_to_dir.keys()))
+    def _calc_dir(ydif, xdif):
+        angle = math.atan2(ydif, xdif)
+        adif = np.abs(key_angles - angle) % (2*math.pi)
+        min_angle = adif.argmin()
+        return angle_to_dir[key_angles[min_angle]]
+    return _calc_dir
+
+def coerce_to_grid(boundss: np.ndarray)-> tuple[np.ndarray, list[tuple[int, int]]]:
+    """
+    Algorithm to coerce a flat list of geometry bounds into a 2D geometry grid.
+    Not well-optimised.
+
+    Assumptions:
+      * scanning by overlapping bounds will discover all boundss
+      * boundss are all the same size
+
+    Returns:
+        grid: np.ndarray
+            2D grid of shapely geometries shaped [H, W]
+        mapping: list[tuple[int, int]]
+            parallel to input flat list, where each geometry ended up in grid
+    """
+    # Ensure order is top-left to bottom-right
+    boundss = sorted(boundss.tolist())
+    boundss = np.asarray(boundss)
+
+    # Get all overlaps
+    geoms = np.asarray([shapely.box(*b) for b in boundss]) # shaped [N, 4, 2]
+    overlaps = shapely.intersects(geoms[:, None], geoms[None])
+
+    # Define how to identify directions
+    _calc_dir = _mk_angle_to_dir_fnc(boundss[0])
+
+    # Start from the first box in boundss. Breadth-first search through the boxes.
+    # Use overlap to identify adjacent boxes.
+    # Assign a y/x coord to each discovered box.
+    # Add each found box and y/x coord to grid_list.
+    open_list = [(0, 0, 0)]
+    closed_list = [0]
+    grid_list = []
+    mapped = {0: (0, 0)}
+    closed_set = {(0, 0)}
+    while len(open_list) > 0:
+        i, y, x = open_list.pop(0)
+        grid_list.append((i, y, x))
+        iylo, ixlo, iyhi, ixhi = boundss[i]
+        icy, icx = (iylo+iyhi)/2, (ixlo+ixhi)/2
+        dists = collections.defaultdict(lambda: [])
+        for j in overlaps[i].nonzero()[0]:
+            if i == j:
+                continue
+            if j not in closed_list:
+                jylo, jxlo, jyhi, jxhi = boundss[j]
+                jcy, jcx = (jylo+jyhi)/2, (jxlo+jxhi)/2
+                dy, dx = jcy-icy, jcx-icx
+                ymod, xmod = _calc_dir(dy, dx)
+                if (y+ymod, x+xmod) not in closed_set:
+                    dists[(ymod, xmod)].append((j.item(), np.linalg.norm((dy, dx)).item()))
+        for (ymod, xmod), distlist in dists.items():
+            d_np = np.array(distlist)
+            j = round(d_np[np.argmin(d_np[:, 1])][0].item())
+            open_list.append((j, y+ymod, x+xmod))
+            mapped[j] = [y+ymod, x+xmod]
+            closed_list.append(j)
+            closed_set.add((y+ymod, x+xmod))
+
+    # Create a 2D grid of coordinates, and populate with boxes found in search
+    grid_list = np.array(grid_list)
+    ymin = grid_list[:, 1].min()
+    xmin = grid_list[:, 2].min()
+    ymax = grid_list[:, 1].max()
+    xmax = grid_list[:, 2].max()
+    grid = shapely.empty((ymax-ymin+1, xmax-xmin+1))
+
+    for i, y, x in grid_list:
+        grid[y-ymin, x-xmin] = shapely.box(*boundss[i])
+
+    mapping = [(round(mapped[j][0]+ymin), round(mapped[j][1]+xmin)) for j in range(len(boundss))]
+
+    return grid, mapping
+
 def regular_grid(
         image_size: tuple[int, int],
         tile_size: tuple[int, int],
@@ -310,6 +409,11 @@ def regular_grid(
         gap = int(xhi-gbxhi)
         grid_strip = np.array([shapely.affinity.translate(cell, 0, gap) for cell in grid[:, -1]])
         grid = np.concatenate([grid, grid_strip[:, None]], axis=1)
+
+    # Remove grid cells outside area
+    mask = shapely.intersects(grid, area)
+    grid[~mask] = None
+
     return grid
 
 
@@ -334,10 +438,10 @@ class WriteStep(Step):
     weight: tuple # outputs of overlap_weights
 
 def plan_from_grid(
-        grid: np.ndarray[shapely.Geometry],
-        margin: tuple[int, int] = (0, 0),
-        area: shapely.Geometry = None,
-        traversal_fnc: callable = row_by_row_traversal
+    grid: np.ndarray[shapely.Geometry],
+    margin: tuple[int, int] = None,
+    area: shapely.Geometry = None,
+    traversal_fnc: callable = row_by_row_traversal
 ) -> list[Step]:
     """
     Create a plan for running on a somewhat arbitrary grid.
@@ -345,6 +449,9 @@ def plan_from_grid(
     There is a restriction/assumption that must be satisfied:
     For each geometry at grid[y, x] the only geoms which overlap a tile are within +-1
     e.g. for grid[5, 5], the only geoms which overlap it are in the range grid[4:7, 4:7]
+
+    Works for "grids" that aren't perfectly regular:
+        * can have small offsets (assuming offsets are smaller than (overlap - margin))
 
     IMPORTANT: All inputs should be YX, not XY.
 
@@ -363,8 +470,8 @@ def plan_from_grid(
             where each tile is placed within the image.
     """
     if area is None:
-        _, _, gyhi, gxhi = shapely.unary_union(grid).bounds
-        area = shapely.box(0, 0, gyhi, gxhi)
+        area = shapely.unary_union(grid)
+        _, _, gyhi, gxhi = area.bounds
 
     # Determine grid boundaries and which cells are possible
     gh, gw = grid.shape[:2]
@@ -376,7 +483,7 @@ def plan_from_grid(
     # By pushing these to helper functions we separate the traversal logic from
     # deciding to load/unload/write only for tiles that need it (based on provided area)
     def _in_bounds(gy, gx):
-        return 0 <= gy < gh and 0 <= gx < gw
+        return 0 <= gy < gh and 0 <= gx < gw and grid[gy, gx] is not None
     def _add_load_step(gy, gx):
         if _in_bounds(gy, gx) and gridcell_needed[gy, gx]:
             plan.append(LoadStep(action='load', index=(gy, gx), geom=grid[gy, gx]))
@@ -416,6 +523,7 @@ def plan_from_grid(
     traversal_fnc(grid, _add_load_step, _add_unload_step, _add_write_step)
 
     return plan
+
 
 def plan_regular_grid(
     image_size: tuple[int, int],

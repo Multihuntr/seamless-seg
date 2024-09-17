@@ -1,3 +1,4 @@
+import random
 import time
 from pathlib import Path
 
@@ -83,12 +84,16 @@ def show_overlap_weights_irregular():
     Image.fromarray(out.astype(np.uint8)).save('test_overlap_weights_irregular.png')
 
 
-def _random_tile_gen(shape):
+def _random_tile_gen(shape, length=None):
     # Generates infinite fake tiles, where each tile is a single, randomly selected colour
+    count = 0
     while True:
         tile = np.ones(shape, dtype=np.uint8)
         tile *= np.random.randint(20, 255, (shape[-1],), dtype=np.uint8)
         yield tile
+        count += 1
+        if length is not None and count >= length:
+            break
 
 
 def minimal_random_colour_grid(image_size, tile_size, overlap):
@@ -110,6 +115,57 @@ def minimal_random_colour_grid(image_size, tile_size, overlap):
         y_slc, x_slc = seamless_seg.shape_to_slices(out_geom)
         out_img[y_slc, x_slc] = out_tile
     # All done!
+
+
+def test_coerce_grid_corrupt():
+    np.random.seed(2342352)
+    image_size = (1024, 1024)
+    image_shape = (*image_size, 3)
+    tile_size = (48, 52)
+    tile_shape = (*tile_size, 3)
+
+    # Clean version, no corruption on grid, normal regular grid
+    area = shapely.Polygon([[540, 125], [180, 690], [730, 565]])
+    grid = seamless_seg.regular_grid(image_size, tile_size, (10, 20), area)
+    plan = seamless_seg.plan_from_grid(grid)
+    ingeoms = seamless_seg.get_plan_input_geoms(plan)
+    in_tiles = [tile for tile in _random_tile_gen(tile_shape, len(ingeoms))]
+    out_img_clean = np.zeros(image_shape)
+    for index, out_geom, out_tile in seamless_seg.run_plan(plan, iter(in_tiles)):
+        y_slc, x_slc = seamless_seg.shape_to_slices(out_geom)
+        out_img_clean[y_slc, x_slc] = out_tile
+
+    vis_folder = Path('vis')
+    vis_folder.mkdir(exist_ok=True)
+    Image.fromarray(out_img_clean.astype(np.uint8)).save(vis_folder / 'clean_grid.png')
+
+    # Corrupt grid: offset cells in the middle slightly
+    grid_central = grid[1:-1, 1:-1]
+    grid_np_coords = shapely.get_coordinates(grid_central)
+    offset = np.random.randint(-1, 1, (grid_np_coords.shape[0]//5, 2))
+    for i in range(5):
+        grid_np_coords[i::5] += offset
+    shapely.set_coordinates(grid_central, grid_np_coords)
+    grid[1:-1, 1:-1] = grid_central
+
+    # Corrupt grid: flatten, randomise order
+    grid_list = list(grid.flatten())
+    random.shuffle(grid_list)
+    grid_np_flat = np.array(grid_list)
+
+    # Now make it work with seamless_seg
+    boundss = np.array([cell.bounds for cell in grid_np_flat if cell is not None])
+    coerced_grid, flat_to_grid_map = seamless_seg.coerce_to_grid(boundss)
+
+    plan = seamless_seg.plan_from_grid(coerced_grid, margin=(3, 8))
+    out_img_corrupt = np.zeros(image_shape)
+    for index, out_geom, out_tile in seamless_seg.run_plan(plan, iter(in_tiles)):
+        y_slc, x_slc = seamless_seg.shape_to_slices(out_geom)
+        out_img_corrupt[y_slc, x_slc] = out_tile
+
+    vis_folder = Path('vis')
+    vis_folder.mkdir(exist_ok=True)
+    Image.fromarray(out_img_corrupt.astype(np.uint8)).save(vis_folder / 'corrupt_grid.png')
 
 
 def random_colour_grid(
