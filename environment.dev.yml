@@ -1,10 +1,16 @@
 name: seamless
 channels:
     - conda-forge
-    - nodefaults
+    - pytorch
+    - nvidia
 dependencies:
     - numpy
     - shapely
     - scipy
     - scikit-image
     - pillow
+    - pytorch
+    - torchvision
+    - pytorch-cuda=11.8
+    - torchgeo
+    - timm

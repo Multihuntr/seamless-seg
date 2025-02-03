@@ -2,7 +2,7 @@
 
 Typical strategies for segmenting large images involve tiling. Unfortunately this can cause visible, obviously incorrect seams between tiles. This repo provides postprocessing functions which gracefully remove *all* such tiling artifacts for any segmentation task.
 
-<!-- TODO: Real example images -->
+![Example](img/comparison_biomedical.jpg)
 
 * :white_check_mark: Optimal! No more tiling artifacts. Guaranteed seamless segmentation for any segmentation model.
 * :floppy_disk: Efficient! Needs <1% of image in memory at once for large images (40000x40000 and above).
@@ -13,122 +13,148 @@ Typical strategies for segmenting large images involve tiling. Unfortunately thi
 
 Copy `seamless_seg.py` into your project.
 
-Dependencies: `shapely` and `scipy`.
+Dependencies: `shapely=2.0` and `scipy`.
 
 <!-- TODO: pip? -->
 
 ## Getting started
 
-Here is a minimum working example of how to use `seamless_seg` on dummy data. In a real example, you would use the logits of a segmentation algorithm.
+If you have a very simple input-output pattern, you can use one of the convenience functions. This will automatically read/mix/write tiles with minimal memory overhead.
 
 ```python
-import numpy as np
-
-import seamless_seg
-
-def minimal_random_colour_grid(image_size, tile_size, overlap):
-    def _input_generator(plan):
-        for index, geom in seamless_seg.get_plan_input_geoms(plan):
-            # Creating fake data; in real use cases, should yield model logits 
-            # obtained by running your model on image data within geom 
-            # Note: geom is a shapely.Geometry
-            tile = np.ones((*tile_size, 3), dtype=np.uint8)
-            tile *= np.random.randint(20, 255, (3,), dtype=np.uint8)
-            yield tile
-
-    # Iterate over output tiles; in this case, write directly to a np array
-    # But in real use cases, you can write the tile to disk (e.g. rasterio/tifffile)
-    plan, grid = seamless_seg.plan_regular_grid(image_size, tile_size, overlap)
-    in_tiles = _input_generator(plan)
-    out_img = np.zeros((*image_size, 3))
-    for index, out_geom, out_tile in seamless_seg.run_plan(plan, in_tiles):
-        y_slc, x_slc = seamless_seg.shape_to_slices(out_geom)
-        out_img[y_slc, x_slc] = out_tile
-    return out_img
-```
-
-Here is an unbatched example using a pytorch model on a geotiff with rasterio
-
-```python
-import rasterio
 import torch
 
 import seamless_seg
 
-model = # get model from somewhere; assuming pytorch model
+model = # get pytorch model from somewhere
+tile_size = # whatever size your model needs
+
+# ###############################
+# Example 1. A simple numpy array
+
+import numpy as np
+
+img = # a numpy image shaped [C, H, W]
+out = seamless_seg.pytorch_numpy(model, img, tile_size)
+# out is a argmax'd segmentation mask shaped [H, W]
+
+# ##################################
+# Example 2. Using rasterio and TIFs
+import rasterio
+
 in_fpath = # get geotiff image from somewhere
 out_fpath = # where to save segmentation
-profile = # geotiff output profile
 
-in_tif = rasterio.open(in_fpath)
-out_tif = rasterio.open(out_fpath, 'w', **profile)
-
-def _input_generator(plan):
-    for index, in_geom in seamless_seg.get_plan_input_geoms(plan):
-        # Read image data
-        in_slices = seamless_seg.shape_to_slices(in_geom)
-        img = in_tif.read(window=in_slices)
-
-        # Push image data through model (don't forget batch dimension)
-        img_th = torch.as_tensor(img[None]).to(model.device)
-        out_th = model(img_th)
-        out = out_th[0].detach().cpu().numpy()
-
-        # Yield model outputs in HWC
-        yield out.transpose((1, 2, 0))
-
-# Run plan on model outputs shown above
-plan, grid = seamless_seg.plan_regular_grid(in_tif.shape, (224, 224), (32, 32))
-in_tiles = _input_generator(plan)
-out_tiles = seamless_seg.run_plan(plan, in_tiles)
-for index, out_geom, out_tile in out_tiles:
-    # Convert logits to segmentation mask
-    seg = out_tile.argmax(axis=-1)
-
-    # Write segmentation mask to disk
-    slices = seamless_seg.shape_to_slices(out_geom)
-    out_tif.write(seg, window=slices)
-
-in_tif.close()
-out_tif.close()
+with rasterio.open(in_fpath) as in_tif:
+    seamless_seg.pytorch_rasterio(model, in_tif, out_fpath, tile_size)
 
 ```
 
-To push model evaluation into a thread and to batch properly, you can replace the `_input_generator` above with the following:
+If you need more control of input/output, you can use other `seamless_seg` functions. The general process is:
+
+1. Define how to obtain logits and how to write after processing (e.g. disk IO functions).
+2. Create a plan to break the image up into tiles.
+3. Execute plan to read/mix/write those tiles.
+
+Here's a minimum working example; it can be copy-paste'd and run as-is. In this case, the "reading" just generates a tile with a random colour for visualisation, and "writing" is all in-memory. In a real example, you would use the logits of a segmentation algorithm, and write each tile to disk as you reached it.
 
 ```python
-batch_size = 16
-def _run_tiles(indexs, geoms):
-    """A function which takes a batch of geoms and returns model outputs for those geoms"""
-    # Load all images for batch
-    imgs = []
-    for in_geom in geoms:
-        in_slices = seamless_seg.shape_to_slices(in_geom)
-        imgs.append(in_tif.read(window=in_slices))
+import shapely
+import numpy as np
 
-    # Push batch through model
-    img_th = torch.as_tensor(np.stack(img)).to(model.device)
-    out_th = model(img_th)
-    out = out_th.detach().cpu().numpy()
+import seamless_seg
 
-    # model output is in BCHW, yield model outputs in BHWC
-    return out.transpose((0, 2, 3, 1))
+image_size = (1024, 1024)
+tile_size = (224, 224)
+overlap = (64, 64)
 
-def _input_generator(plan):
-    geoms = seamless_seg.get_plan_input_geoms(plan)
-    return seamless_seg.threaded_batched_tile_get(geoms, batch_size, _run_tiles, batch_size*3)
+# 1. Define how to obtain logits and how to write after processing
+def random_logits(geom: shapely.Geometry):
+    # Creating fake data; in real use cases, should yield model logits
+    # obtained by running your model on image data within geom
+    tile = np.ones((*tile_size, 3), dtype=np.uint8)
+    tile *= np.random.randint(20, 255, (3,), dtype=np.uint8)
+    return tile
+
+out_img = np.zeros((*image_size, 3))
+def write_to_numpy_array(geom, tile):
+    # Writing to the in-memory numpy array above;
+    # when evaluating on large files, this should write to disk instead
+    y_slc, x_slc = seamless_seg.shape_to_slices(geom)
+    out_img[y_slc, x_slc] = tile
+
+# 2. Create a plan to break the image up into tiles.
+def tile_generator(plan, get_logits):
+    # Important: use seamless_seg.get_plan_logit_geoms to yield the correct order of tiles
+    for index, geom in seamless_seg.get_plan_logit_geoms(plan):
+        yield get_logits(geom)
+
+plan, grid = seamless_seg.plan_regular_grid(image_size, tile_size, overlap)
+in_tiles = tile_generator(plan, random_logits)
+
+# 3. Execute plan to read/mix/write those tiles.
+for index, out_geom, out_tile in seamless_seg.run_plan(plan, in_tiles):
+    # Thanks to generators, this doesn't have to hold all tiles in memory at once
+    write_to_numpy_array(out_geom, out_tile)
 ```
 
-Additionally, there are more advanced use cases supported by `seamless_seg`:
-* Only running on an area within the overall image
-  * Pass `area=<shapely.Geometry>` to `seamless_seg.plan_regular_grid`.
-* Custom, semi-regular grids:
-  * Create your grid, then use `seamless_seg.plan_from_grid` instead of `seamless_seg.plan_regular_grid`.
-* Fixed RAM limits:
-  * Pass `max_tiles=<int>` and `disk_cache_dir=<Path>` to `seamless_seg.run_plan`.
-  * This will cache model outputs beyond `max_tiles` to disk, instead of recomputing.
-* Batching utility functions:
-  * See `seamless_seg.batched_tile_get` and `seamless_seg.threaded_batched_tile_get`.
+In a real example, the `in_tiles` from above should be a generator of logits. For convenience, `seamless_seg` provides a function to obtain logits from a simple pytorch model.
+
+```python
+plan = # Assume we have a plan already
+model = # Assume we have a model from somewhere else
+read_tile = # Callable that takes a geometry and return a numpy array of input data
+# e.g. if you have an in_tif
+def read_tile(shp):
+    return in_tif.read(window=shape_to_slices(shp))
+
+in_tiles = seamless_seg.pytorch_outputs_generator(plan, model, read_tile)
+```
+
+In the above examples, `seamless_seg` was responsible for creating the tile geometries, and used these to create the `plan`. You can bring your own input geometries.
+
+```python
+import seamless_seg
+
+# grid must be a np.array shaped [H, W] where each element is a shapely.Geometry
+# You can use seamless_seg functions to create this:
+# You can create a perfectly regular grid
+grid = seamless_seg.regular_grid(image_size, tile_size, overlap)
+# or, you can try to coerce a flat list of geometries into a grid shape
+grid = seamless_seg.coerce_to_grid(flat_list_of_geometries)
+# or,
+grid = # whatever you like
+
+# Regardless, the planning will minimise the memory footprint
+plan = seamless_seg.plan_from_grid(grid)
+```
+
+At the lowest level, if you just want to blend together tiles that you've loaded yourself, you can use:
+
+```python
+import seamless_seg
+
+central_geom = # a shapely.Geometry
+central_tile = # a np.ndarray
+nearby_geoms = # list of shapely.Geometry
+nearby_tiles = # list of np.ndarrays
+
+weights = seamless_seg.overlap_weights(central_geom, nearby_geoms)
+_, out_tile = seamless_seg.apply_weights(central_tile, nearby_tiles)
+```
+
+## Optimisation
+
+There are many optional parameters for each function. Most of these are optimisation parameters to run faster or with less RAM.
+
+These are the most likely use cases, and how to do them:
+* Run only on a small patch of a large image.
+  * Pass `area=<shapely.Geometry>` where available.
+* Extreme RAM requirements:
+  * Pass `max_tiles=<int>` and `disk_cache_dir=<Path>` where available.
+* Batching, running models in a separate thread:
+  * Pytorch segmentation model: Pass `batch_size>1` to either `seamless_seg.pytorch_outputs_generator` or `seamless_seg.pytorch_rasterio`.
+  * Custom segmentation: Use `seamless_seg.batched_tile_get` and `seamless_seg.threaded_batched_tile_get`.
 
 ## Explanation - Fixing tiling artifacts
 
@@ -136,7 +162,7 @@ Additionally, there are more advanced use cases supported by `seamless_seg`:
 
 Tiling artifacts are a result of hard boundaries between adajcent tiles. The most naive approach is to select tiles with no overlap, and just let the model predict whatever it wills. At the boundary of those tiles, models will often make significantly different predictions. This results in sharp lines in your output segmentation.
 
-<!-- TODO: Real example -->
+![No overlap between tiles causes sharp lines in output](img/no_overlap_gridding.jpg)
 
 This is not a model failure per se. The problem is just that the model is using a different context for pixels on one side of a boundary to the other side of that boundary. If it were given a full context around each object, it may still segment it correctly.
 
@@ -146,7 +172,7 @@ Typical solutions to this will always somehow use overlapping tiles. A slightly 
 
 <!-- TODO: Diagram explaining output crop margin. -->
 
-<!-- TODO: Example of reducing tiling artifacts. -->
+![Using 25% overlap still results in sharp lines](img/25p_overlap_gridding.jpg)
 
 In the extreme case, we could evaluate a tile centered on every single pixel independently and only trust that central pixel. But this involves lots of redundant calculation. We need a better solution.
 
@@ -184,5 +210,3 @@ Finally, `seamless_seg.run_plan` is provided to actually run the plan. To contro
 Often large segmentation tasks have images that are too large to fit into RAM. So, the tiling plan includes explicit load/unload instructions. Following this plan ensures that tiles are never requested more than once **and** that the minimum number of tiles are kept in memory. For some perspective, given a (40000, 40000) image with a tile size of (256, 256) and an overlap of (64, 64), there will be at most 1.0% of the image held in memory at once.
 
 If even this is too large, you can use the `max_tiles` and `disk_cache_dir` arguments to hold as few tiles in memory as you need. Tiles beyond this limit will be cached to disk.
-
-
