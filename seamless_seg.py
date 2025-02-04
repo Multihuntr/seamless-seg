@@ -792,10 +792,18 @@ def run_plan(
         on_step(n)
 
 
-def pytorch_outputs_generator(plan, model, read_tile, batch_size: int = None):
+def pytorch_outputs_generator(plan, model, read_tile, batch_size: int = None, device: str = None):
     import torch
 
-    device = next(model.parameters()).device
+    if device is None:
+        if isinstance(model, torch.nn.Module):
+            device = next(model.parameters()).device
+        elif getattr(model, "device") is not None:
+            device = getattr(model, "device")
+        else:
+            device = "cpu"
+    else:
+        device = device
 
     if batch_size is not None and batch_size >= 1:
 
@@ -842,8 +850,9 @@ def run_plan_pytorch(
     batch_size: int = None,
     max_tiles: int = None,
     disk_cache_dir: Path = None,
+    device: str = None,
 ):
-    in_tiles = pytorch_outputs_generator(plan, model, read_tile, batch_size)
+    in_tiles = pytorch_outputs_generator(plan, model, read_tile, batch_size, device)
     out_tiles = run_plan(plan, in_tiles, max_tiles=max_tiles, disk_cache_dir=disk_cache_dir)
     for index, out_geom, out_tile in out_tiles:
         write_tile(out_geom, out_tile)
@@ -860,6 +869,7 @@ def pytorch_rasterio(
     area_in_crs: bool = True,
     max_tiles: int = None,
     disk_cache_dir: Path = None,
+    device: str = None,
 ):
     """
     Create a seamless segmentation in `out_tif`.
@@ -874,20 +884,22 @@ def pytorch_rasterio(
             Size of input to model
         model: callable[torch.Tensor -> torch.Tensor]
             Takes batch of image data, returns logits for the same shape
-        batch_size: int
+        batch_size: int, Optional
             If provided and greater than 1, runs model in batches of this size
-        overlap: int | tuple[int, int]
+        overlap: int | tuple[int, int], Optional
             Pixel overlap between tiles; larger overlap causes more gradual change, but is more expensive.
             Optional: default is half maximum to balance speed and performance.
-        area: shapely.Geometry
+        area: shapely.Geometry, Optional
             Only run the model on a subset of the in_tif
-        area_in_crs: bool
+        area_in_crs: bool, Optional
             If True (default) assumes `area` is in CRS of `in_tif`.
             If False assumes `area` is in pixels.
-        max_tiles: int
+        max_tiles: int, Optional
             To control memory footprint, you can set a maximum number of tiles to load at once.
-        disk_cache_dir: Path
+        disk_cache_dir: Path, Optional
             When used in conjunction with max_tiles, will cache logits to disk during computation.
+        device: str, Optional
+            If provided, puts tiles onto device. Else attempts to read device from model. Else crashes.
 
     """
     import rasterio
@@ -908,8 +920,6 @@ def pytorch_rasterio(
 
         def read_tile(shp):
             img = in_tif.read(window=shape_to_slices(shp))
-            img = img.astype(np.float32)
-            img /= 255
             return img
 
         def write_tile(shp, tile):
@@ -926,7 +936,9 @@ def pytorch_rasterio(
             area = shapely.set_coordinates(area, coords)
 
         plan, grid = plan_regular_grid(in_tif.shape, tile_size, overlap, area=area)
-        run_plan_pytorch(plan, model, read_tile, write_tile, batch_size, max_tiles, disk_cache_dir)
+        run_plan_pytorch(
+            plan, model, read_tile, write_tile, batch_size, max_tiles, disk_cache_dir, device
+        )
 
 
 def pytorch_numpy(
@@ -937,6 +949,7 @@ def pytorch_numpy(
     batch_size: int = None,
     max_tiles: int = None,
     disk_cache_dir: Path = None,
+    device: str = None,
 ):
     """
     Create a seamless segmentation of `img` using `model`.
@@ -964,6 +977,8 @@ def pytorch_numpy(
             To control memory footprint, you can set a maximum number of tiles to load at once.
         disk_cache_dir: Path
             When used in conjunction with max_tiles, will cache logits to disk during computation.
+        device: str, Optional
+            If provided, processes tiles on device. Else attempts to read device from model. Else crashes.
 
     """
     out = np.zeros(img.shape[1:], dtype=np.int32)
@@ -986,6 +1001,8 @@ def pytorch_numpy(
         overlap = tile_size[0] // 4, tile_size[1] // 4
 
     plan, grid = plan_regular_grid(img.shape[1:], tile_size, overlap)
-    run_plan_pytorch(plan, model, read_tile, write_tile, batch_size, max_tiles, disk_cache_dir)
+    run_plan_pytorch(
+        plan, model, read_tile, write_tile, batch_size, max_tiles, disk_cache_dir, device
+    )
 
     return out

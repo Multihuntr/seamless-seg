@@ -140,7 +140,7 @@ nearby_geoms = # list of shapely.Geometry
 nearby_tiles = # list of np.ndarrays
 
 weights = seamless_seg.overlap_weights(central_geom, nearby_geoms)
-_, out_tile = seamless_seg.apply_weights(central_tile, nearby_tiles)
+_, out_tile = seamless_seg.apply_weights(central_tile, nearby_tiles, weights)
 ```
 
 ## Optimisation
