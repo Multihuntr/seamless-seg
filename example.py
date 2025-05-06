@@ -11,6 +11,9 @@ import seamless_seg
 from PIL import Image
 
 
+VIS_FOLDER = Path('vis')
+
+
 def test_overlap_trim():
     geom_a = shapely.box(0, 0, 100, 100)
     geom_b = shapely.box(0, 60, 100, 160)
@@ -37,9 +40,9 @@ def show_overlap_weights_regular():
         shapely.box(450, -150, 750, 350), #bl
         shapely.box(-50, 750, 250, 1250), #tr
         shapely.box(450, 750, 750, 1250), #br
-        shapely.box(200, -150, 500, 350),  # l
+        shapely.box(200, -150, 500, 350), # l
         shapely.box(-50, 300, 250, 800),  # t
-        shapely.box(200, 750, 500, 1250),  # r
+        shapely.box(200, 750, 500, 1250), # r
         shapely.box(450, 300, 750, 800),  # b
     ]
     central_tile = np.ones((300, 500, 3), dtype=np.uint8)
@@ -52,10 +55,10 @@ def show_overlap_weights_regular():
 
     # Run seamless_seg to calculate new central tile
     weights = seamless_seg.overlap_weights(central_geom, boxes)
-    out = seamless_seg.apply_weights(central_tile, nearby_tiles, weights)
+    _, out = seamless_seg.apply_weights(central_tile, nearby_tiles, weights)
 
     # Printing output for inspection
-    Image.fromarray(out.astype(np.uint8)).save('test_overlap_weights_regular.png')
+    Image.fromarray(out.astype(np.uint8)).save(VIS_FOLDER / 'test_overlap_weights_regular.png')
 
 def show_overlap_weights_irregular():
     np.random.seed(123459)
@@ -78,10 +81,10 @@ def show_overlap_weights_irregular():
 
     # Run seamless_seg to calculate new central tile
     weights = seamless_seg.overlap_weights(central_geom, boxes)
-    out = seamless_seg.apply_weights(central_tile, nearby_tiles, weights)
+    _, out = seamless_seg.apply_weights(central_tile, nearby_tiles, weights)
 
     # Printing output for inspection
-    Image.fromarray(out.astype(np.uint8)).save('test_overlap_weights_irregular.png')
+    Image.fromarray(out.astype(np.uint8)).save(VIS_FOLDER / 'test_overlap_weights_irregular.png')
 
 
 def _random_tile_gen(shape, length=None):
@@ -96,27 +99,6 @@ def _random_tile_gen(shape, length=None):
             break
 
 
-def minimal_random_colour_grid(image_size, tile_size, overlap):
-    def _input_generator(plan):
-        shape = (*tile_size, 3)
-        for index, geom in seamless_seg.get_plan_input_geoms(plan):
-            # Creating fake data; in real use cases, should yield image data from within geom
-            # Note: geom is a shapely.Geometry
-            tile = np.ones(shape, dtype=np.uint8)
-            tile *= np.random.randint(20, 255, (3,), dtype=np.uint8)
-            yield tile
-
-    # Iterate over output tiles; in this case, write directly to a np array
-    # But in real use cases, you can write the tile to disk (e.g. rasterio/tifffile)
-    plan, grid = seamless_seg.plan_regular_grid(image_size, tile_size, overlap)
-    in_tiles = _input_generator(plan)
-    out_img = np.zeros((*image_size, 3))
-    for index, out_geom, out_tile in seamless_seg.run_plan(plan, in_tiles):
-        y_slc, x_slc = seamless_seg.shape_to_slices(out_geom)
-        out_img[y_slc, x_slc] = out_tile
-    # All done!
-
-
 def test_coerce_grid_corrupt():
     np.random.seed(2342352)
     image_size = (1024, 1024)
@@ -128,16 +110,14 @@ def test_coerce_grid_corrupt():
     area = shapely.Polygon([[540, 125], [180, 690], [730, 565]])
     grid = seamless_seg.regular_grid(image_size, tile_size, (10, 20), area)
     plan = seamless_seg.plan_from_grid(grid)
-    ingeoms = seamless_seg.get_plan_input_geoms(plan)
+    ingeoms = seamless_seg.get_plan_logit_geoms(plan)
     in_tiles = [tile for tile in _random_tile_gen(tile_shape, len(ingeoms))]
     out_img_clean = np.zeros(image_shape)
     for index, out_geom, out_tile in seamless_seg.run_plan(plan, iter(in_tiles)):
         y_slc, x_slc = seamless_seg.shape_to_slices(out_geom)
         out_img_clean[y_slc, x_slc] = out_tile
 
-    vis_folder = Path('vis')
-    vis_folder.mkdir(exist_ok=True)
-    Image.fromarray(out_img_clean.astype(np.uint8)).save(vis_folder / 'clean_grid.png')
+    Image.fromarray(out_img_clean.astype(np.uint8)).save(VIS_FOLDER / 'clean_grid.png')
 
     # Corrupt grid: offset cells in the middle slightly
     grid_central = grid[1:-1, 1:-1]
@@ -163,9 +143,7 @@ def test_coerce_grid_corrupt():
         y_slc, x_slc = seamless_seg.shape_to_slices(out_geom)
         out_img_corrupt[y_slc, x_slc] = out_tile
 
-    vis_folder = Path('vis')
-    vis_folder.mkdir(exist_ok=True)
-    Image.fromarray(out_img_corrupt.astype(np.uint8)).save(vis_folder / 'corrupt_grid.png')
+    Image.fromarray(out_img_corrupt.astype(np.uint8)).save(VIS_FOLDER / 'corrupt_grid.png')
 
 
 def random_colour_grid(
@@ -215,9 +193,8 @@ def random_colour_grid(
         coords = shapely.get_coordinates(area)
         rr, cc = skimage.draw.polygon(coords[:, 0], coords[:, 1])
         out_img[rr, cc] = 255
-    vis_folder = Path('vis')
-    vis_folder.mkdir(exist_ok=True)
-    Image.fromarray(out_img.astype(np.uint8)).save(vis_folder / fname)
+
+    Image.fromarray(out_img.astype(np.uint8)).save(VIS_FOLDER / fname)
 
 def test_batched_colour_grid(
     image_size,
@@ -231,7 +208,7 @@ def test_batched_colour_grid(
         return np.stack([next(random_tiles) for _ in geoms])
 
     def _input_generator(plan):
-        geoms = seamless_seg.get_plan_input_geoms(plan)
+        geoms = seamless_seg.get_plan_logit_geoms(plan)
         return seamless_seg.threaded_batched_tile_get(geoms, batch_size, _get_tiles, batch_size*3)
 
     # Iterate over output tiles; in this case, write directly to a np array
@@ -299,7 +276,7 @@ def random_colour_grid_visualise_cache(image_size, tile_size, overlap, do_print=
         plan,
         in_tile_gen,
         10,
-        disk_cache_dir=Path('vis/data-cache'),
+        disk_cache_dir=(VIS_FOLDER / 'data-cache'),
         on_load=_on_load,
         on_unload=_on_unload,
         on_disk_evict=_on_disk_evict,
@@ -322,12 +299,15 @@ def main():
         [38, 55], [44, 37], [26, 28], [44, 19], [40, 4], [17, 6]
     ])
 
+
+    VIS_FOLDER.mkdir(exist_ok=True)
     random_colour_grid((48, 64), (5, 5), (2, 2), actually_run=True, fname='small_grid.png')
     random_colour_grid((128, 86), (7, 7), (2, 2), area=area, actually_run=True, fname='small_grid_w_area.png')
     random_colour_grid((256, 256), (58, 84), (6, 12), actually_run=True, fname='mid_grid.png')
     # random_colour_grid((40000, 40000), (256, 256), (64, 64), actually_run=False)
     # random_colour_grid_visualise_cache((48, 64), (11,11), (2, 2))
     test_batched_colour_grid((128, 86), (7, 7), (2, 2), fname='small_grid_batched.png')
+
 
 if __name__ == '__main__':
     main()
